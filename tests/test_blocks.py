@@ -1,3 +1,5 @@
+import types
+
 from clickhouse_driver.errors import ServerException
 from tests.testcase import BaseTestCase
 
@@ -83,3 +85,14 @@ class ProgressTestCase(BaseTestCase):
         self.client.execute_with_progress('SELECT CAST(2 AS Int32) as x')
         rv = self.client.cancel(with_column_types=True)
         self.assertEqual(rv, ([(2,)], [('x', 'Int32')]))
+
+
+class IteratorTestCase(BaseTestCase):
+    def test_select_with_iter(self):
+        result = self.client.execute_iter(
+            'SELECT number FROM system.numbers LIMIT 10'
+        )
+        self.assertIsInstance(result, types.GeneratorType)
+
+        self.assertEqual(list(result), list(zip(range(10))))
+        self.assertEqual(list(result), [])

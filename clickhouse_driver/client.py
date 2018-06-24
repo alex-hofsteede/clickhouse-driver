@@ -82,6 +82,10 @@ class Client(object):
             self.receive_no_progress_result(result, columnar)
             return result.get_result()
 
+    def iter_receive_result(self):
+        for row in self.iter_receive_no_progress_result():
+            yield row
+
     def receive_progress_result(self, result, columnar=False):
         rows_read, approx_rows_to_read = 0, 0
         while True:
@@ -120,7 +124,6 @@ class Client(object):
         if block is None:
             return
 
-        # Header block contains no rows. Pick columns from it.
         if block.rows:
             if columnar:
                 columns = block.get_columns()
@@ -133,8 +136,31 @@ class Client(object):
             else:
                 result.data.extend(block.get_rows())
 
+        # Header block contains no rows. Pick columns information from it.
         elif not result.columns_with_types:
             result.columns_with_types = block.columns_with_types
+
+    def iter_receive_no_progress_result(self):
+        while True:
+            packet = self.receive_packet()
+            if not packet:
+                break
+
+            if packet is True:
+                continue
+
+            for row in self.iter_store_query_result(packet):
+                yield row
+
+    def iter_store_query_result(self, packet):
+        block = getattr(packet, 'block', None)
+        if block is None:
+            return
+
+        # Header block contains no rows. Pick columns from it.
+        if block.rows:
+            for row in block.get_rows():
+                yield row
 
     def receive_packet(self):
         packet = self.connection.receive_packet()
@@ -160,14 +186,16 @@ class Client(object):
         else:
             return True
 
+    def make_query_settings(self, settings):
+        query_settings = self.settings.copy()
+        query_settings.update(settings or {})
+        return query_settings
+
     def execute(self, query, params=None, with_column_types=False,
                 external_tables=None, query_id=None, settings=None,
                 types_check=False, columnar=False):
 
-        query_settings = self.settings.copy()
-        query_settings.update(settings or {})
-
-        self.connection.context.settings = query_settings
+        self.connection.context.settings = self.make_query_settings(settings)
 
         self.connection.force_connect()
 
@@ -178,15 +206,14 @@ class Client(object):
             if is_insert:
                 return self.process_insert_query(
                     query, params, external_tables=external_tables,
-                    query_id=query_id, settings=query_settings,
-                    types_check=types_check
+                    query_id=query_id, types_check=types_check
                 )
             else:
                 return self.process_ordinary_query(
                     query, params=params, with_column_types=with_column_types,
                     external_tables=external_tables,
-                    query_id=query_id, settings=query_settings,
-                    types_check=types_check, columnar=columnar
+                    query_id=query_id, types_check=types_check,
+                    columnar=columnar
                 )
 
         except Exception:
@@ -198,10 +225,7 @@ class Client(object):
             external_tables=None, query_id=None, settings=None,
             types_check=False):
 
-        query_settings = self.settings.copy()
-        query_settings.update(settings or {})
-
-        self.connection.context.settings = query_settings
+        self.connection.context.settings = self.make_query_settings(settings)
 
         self.connection.force_connect()
 
@@ -209,9 +233,29 @@ class Client(object):
             return self.process_ordinary_query_with_progress(
                 query, params=params, with_column_types=with_column_types,
                 external_tables=external_tables,
-                query_id=query_id, settings=query_settings,
-                types_check=types_check
+                query_id=query_id, types_check=types_check
             )
+
+        except Exception:
+            self.connection.disconnect()
+            raise
+
+    def execute_iter(self, query, params=None, external_tables=None,
+                     query_id=None, settings=None, types_check=False):
+
+        self.connection.context.settings = self.make_query_settings(settings)
+
+        self.connection.force_connect()
+
+        try:
+            rows = self.iter_process_ordinary_query(
+                query, params=params,
+                external_tables=external_tables,
+                query_id=query_id, types_check=types_check
+            )
+
+            for row in rows:
+                yield row
 
         except Exception:
             self.connection.disconnect()
@@ -219,13 +263,13 @@ class Client(object):
 
     def process_ordinary_query_with_progress(
             self, query, params=None, with_column_types=False,
-            external_tables=None, query_id=None, settings=None,
+            external_tables=None, query_id=None,
             types_check=False, columnar=False):
 
         if params is not None:
             query = self.substitute_params(query, params)
 
-        self.connection.send_query(query, query_id=query_id, settings=settings)
+        self.connection.send_query(query, query_id=query_id)
         self.connection.send_external_tables(external_tables,
                                              types_check=types_check)
         return self.receive_result(with_column_types=with_column_types,
@@ -233,23 +277,36 @@ class Client(object):
 
     def process_ordinary_query(
             self, query, params=None, with_column_types=False,
-            external_tables=None, query_id=None, settings=None,
+            external_tables=None, query_id=None,
             types_check=False, columnar=False):
 
         if params is not None:
             query = self.substitute_params(query, params)
 
-        self.connection.send_query(query, query_id=query_id, settings=settings)
+        self.connection.send_query(query, query_id=query_id)
         self.connection.send_external_tables(external_tables,
                                              types_check=types_check)
         return self.receive_result(with_column_types=with_column_types,
                                    columnar=columnar)
 
+    def iter_process_ordinary_query(
+            self, query, params=None,
+            external_tables=None, query_id=None,
+            types_check=False, columnar=False):
+
+        if params is not None:
+            query = self.substitute_params(query, params)
+
+        self.connection.send_query(query, query_id=query_id)
+        self.connection.send_external_tables(external_tables,
+                                             types_check=types_check)
+        for row in self.iter_receive_result():
+            yield row
+
     def process_insert_query(self, query_without_data, data,
                              external_tables=None, query_id=None,
-                             settings=None, types_check=False):
-        self.connection.send_query(query_without_data, query_id=query_id,
-                                   settings=settings)
+                             types_check=False):
+        self.connection.send_query(query_without_data, query_id=query_id)
         self.connection.send_external_tables(external_tables,
                                              types_check=types_check)
 
